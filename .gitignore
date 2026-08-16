@@ -7,3 +7,4 @@ dist/
 *.egg-info/
 network-ai-evidence/
 /.venv/
+/fixtures/
