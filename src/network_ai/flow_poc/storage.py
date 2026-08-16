@@ -40,6 +40,9 @@ MAX_ANALYSIS_RUNS = 1_000
 MAX_CANDIDATE_INSTANCES = 20_000
 COLLECTION_RUN_STALE_SECONDS = 30
 REPLAY_WINDOW_SECONDS = 600
+MAX_LOCAL_SIGNATURES = 2_000
+MAX_SIGNATURE_NAME_BYTES = 256
+MAX_SIGNATURE_RULE_BYTES = 8_192
 
 ANALYSIS_RUN_REASON_CODES = frozenset(
     (
@@ -321,6 +324,16 @@ class FlowRepository:
                     PRIMARY KEY(analysis_run_id, candidate_id)
                 );
                 CREATE INDEX IF NOT EXISTS analysis_run_candidates_candidate ON analysis_run_candidates(candidate_id);
+                CREATE TABLE IF NOT EXISTS local_signatures (
+                    signature_id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    severity INTEGER NOT NULL,
+                    rule_text TEXT NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS local_signatures_enabled ON local_signatures(enabled, signature_id);
                 """
             )
             candidate_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(candidates)")}
@@ -374,6 +387,192 @@ class FlowRepository:
     def foreign_keys_enabled(self) -> bool:
         with self._connect() as connection:
             return bool(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+
+    @staticmethod
+    def _signature_values(
+        *,
+        signature_id: object,
+        name: object,
+        severity: object,
+        rule_text: object,
+        enabled: object,
+    ) -> tuple[int, str, int, str, bool]:
+        if type(signature_id) is not int or not 1 <= signature_id <= 2_147_483_647:
+            raise ValueError("signature_id_invalid")
+        if not isinstance(name, str):
+            raise ValueError("signature_name_invalid")
+        canonical_name = name.strip()
+        if not canonical_name or len(canonical_name.encode("utf-8")) > MAX_SIGNATURE_NAME_BYTES:
+            raise ValueError("signature_name_invalid")
+        if type(severity) is not int or not 1 <= severity <= 4:
+            raise ValueError("signature_severity_invalid")
+        if not isinstance(rule_text, str):
+            raise ValueError("signature_rule_invalid")
+        canonical_rule_text = rule_text.strip()
+        if not canonical_rule_text or len(canonical_rule_text.encode("utf-8")) > MAX_SIGNATURE_RULE_BYTES:
+            raise ValueError("signature_rule_invalid")
+        if type(enabled) is not bool:
+            raise ValueError("signature_enabled_invalid")
+        return signature_id, canonical_name, severity, canonical_rule_text, enabled
+
+    @staticmethod
+    def _signature_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "created_at": row[5],
+            "enabled": bool(row[4]),
+            "name": row[1],
+            "rule_text": row[3],
+            "severity": row[2],
+            "signature_id": row[0],
+            "updated_at": row[6],
+        }
+
+    def signature_rows(self) -> tuple[dict[str, Any], ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT signature_id, name, severity, rule_text, enabled, created_at, updated_at
+                   FROM local_signatures ORDER BY signature_id"""
+            ).fetchall()
+        return tuple(self._signature_row(row) for row in rows if row is not None)
+
+    def save_signature(
+        self,
+        *,
+        signature_id: object,
+        name: object,
+        severity: object,
+        rule_text: object,
+        enabled: object,
+        require_existing: bool | None,
+    ) -> dict[str, Any]:
+        values = self._signature_values(
+            signature_id=signature_id,
+            name=name,
+            severity=severity,
+            rule_text=rule_text,
+            enabled=enabled,
+        )
+        now = _iso(datetime.now(tz=timezone.utc))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing = connection.execute(
+                    "SELECT 1 FROM local_signatures WHERE signature_id = ?", (values[0],)
+                ).fetchone()
+                if require_existing is True and existing is None:
+                    raise ValueError("signature_not_found")
+                if require_existing is False and existing is not None:
+                    raise ValueError("signature_already_exists")
+                if existing is None:
+                    count = int(connection.execute("SELECT COUNT(*) FROM local_signatures").fetchone()[0])
+                    if count >= MAX_LOCAL_SIGNATURES:
+                        raise ValueError("signature_capacity_exceeded")
+                    connection.execute(
+                        """INSERT INTO local_signatures(
+                            signature_id, name, severity, rule_text, enabled, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (*values[:4], int(values[4]), now, now),
+                    )
+                else:
+                    connection.execute(
+                        """UPDATE local_signatures SET name = ?, severity = ?, rule_text = ?, enabled = ?, updated_at = ?
+                           WHERE signature_id = ?""",
+                        (*values[1:4], int(values[4]), now, values[0]),
+                    )
+                row = connection.execute(
+                    """SELECT signature_id, name, severity, rule_text, enabled, created_at, updated_at
+                       FROM local_signatures WHERE signature_id = ?""",
+                    (values[0],),
+                ).fetchone()
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        self._set_database_modes()
+        result = self._signature_row(row)
+        assert result is not None
+        return result
+
+    def set_signature_enabled(self, *, signature_id: object, enabled: object) -> dict[str, Any]:
+        if type(signature_id) is not int or not 1 <= signature_id <= 2_147_483_647:
+            raise ValueError("signature_id_invalid")
+        if type(enabled) is not bool:
+            raise ValueError("signature_enabled_invalid")
+        now = _iso(datetime.now(tz=timezone.utc))
+        with self._connect() as connection:
+            changed = connection.execute(
+                "UPDATE local_signatures SET enabled = ?, updated_at = ? WHERE signature_id = ?",
+                (int(enabled), now, signature_id),
+            ).rowcount
+            if changed != 1:
+                raise ValueError("signature_not_found")
+            row = connection.execute(
+                """SELECT signature_id, name, severity, rule_text, enabled, created_at, updated_at
+                   FROM local_signatures WHERE signature_id = ?""",
+                (signature_id,),
+            ).fetchone()
+        self._set_database_modes()
+        result = self._signature_row(row)
+        assert result is not None
+        return result
+
+    def delete_signature(self, *, signature_id: object) -> bool:
+        if type(signature_id) is not int or not 1 <= signature_id <= 2_147_483_647:
+            raise ValueError("signature_id_invalid")
+        with self._connect() as connection:
+            deleted = connection.execute(
+                "DELETE FROM local_signatures WHERE signature_id = ?", (signature_id,)
+            ).rowcount
+        self._set_database_modes()
+        return deleted == 1
+
+    def import_signatures(self, values: object) -> int:
+        if not isinstance(values, list) or len(values) > MAX_LOCAL_SIGNATURES:
+            raise ValueError("signature_import_invalid")
+        signatures = tuple(
+            self._signature_values(
+                signature_id=item.get("signature_id") if isinstance(item, dict) else None,
+                name=item.get("name") if isinstance(item, dict) else None,
+                severity=item.get("severity") if isinstance(item, dict) else None,
+                rule_text=item.get("rule_text") if isinstance(item, dict) else None,
+                enabled=item.get("enabled") if isinstance(item, dict) else None,
+            )
+            for item in values
+        )
+        if len({signature[0] for signature in signatures}) != len(signatures):
+            raise ValueError("signature_import_duplicate_id")
+        now = _iso(datetime.now(tz=timezone.utc))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing_ids = {
+                    int(row[0])
+                    for row in connection.execute("SELECT signature_id FROM local_signatures")
+                }
+                required_new = len({signature[0] for signature in signatures} - existing_ids)
+                if len(existing_ids) + required_new > MAX_LOCAL_SIGNATURES:
+                    raise ValueError("signature_capacity_exceeded")
+                for signature in signatures:
+                    connection.execute(
+                        """INSERT INTO local_signatures(
+                            signature_id, name, severity, rule_text, enabled, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(signature_id) DO UPDATE SET
+                            name = excluded.name,
+                            severity = excluded.severity,
+                            rule_text = excluded.rule_text,
+                            enabled = excluded.enabled,
+                            updated_at = excluded.updated_at""",
+                        (*signature[:4], int(signature[4]), now, now),
+                    )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        self._set_database_modes()
+        return len(signatures)
 
     def _root_usage_bytes(self) -> int:
         return sum(path.stat().st_size for path in self.root.glob("flow-poc.sqlite3*") if path.is_file())
@@ -894,7 +1093,13 @@ class FlowRepository:
         # A local import keeps the persistence module independent during
         # package initialization while pinning commits to the default,
         # versioned detector contract used by ``analyze_and_record``.
-        from .analysis import FlowAnalyzer, PERIODIC_SUPPORTED_PROTOCOLS
+        from .analysis import (
+            BASELINE_HISTORY_WINDOWS,
+            BASELINE_MIN_OBSERVED_FLOWS,
+            BASELINE_RATE_MULTIPLIER,
+            FlowAnalyzer,
+            PERIODIC_SUPPORTED_PROTOCOLS,
+        )
 
         analyzer = FlowAnalyzer()
         source_ids = {str(row["flow_id"]) for row in source_rows}
@@ -956,6 +1161,97 @@ class FlowRepository:
                     and candidate.window_start == event_time
                     and candidate.window_end == event_time
                     and candidate.uncertainty == ("sampling-unknown", "ip-allowlisted-unauthenticated")
+                )
+                continue
+
+            if candidate.rule_id == "flow-rate-baseline.v1":
+                require(candidate.rule_version == "flow-rate-baseline.v1")
+                scope = basis.get("contributor_scope")
+                if not isinstance(scope, dict):
+                    raise ValueError("invalid_candidate_identity")
+                try:
+                    window_start = _parse_iso(str(scope["window_start"]))
+                    window_end = _parse_iso(str(scope["window_end"]))
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("invalid_candidate_identity") from exc
+                require(
+                    window_end == window_start + timedelta(seconds=analyzer.window_seconds)
+                    and scope.get("session_key") == candidate.session_key
+                    and scope.get("source_ip") == candidate.source_ip
+                    and scope.get("protocol") == candidate.protocol
+                    and candidate.destination_ip is None
+                    and candidate.destination_port is None
+                )
+                matching = tuple(
+                    row for row in source_rows
+                    if row["session_key"] == scope["session_key"]
+                    and row["source_ip"] == scope["source_ip"]
+                    and row["protocol"] == scope["protocol"]
+                    and window_start <= _parse_iso(str(row["event_time"])) < window_end
+                )
+                historical_counts: list[int] = []
+                for offset in range(BASELINE_HISTORY_WINDOWS, 0, -1):
+                    historical_start = window_start - timedelta(seconds=analyzer.window_seconds * offset)
+                    historical_end = historical_start + timedelta(seconds=analyzer.window_seconds)
+                    count = sum(
+                        1
+                        for row in source_rows
+                        if row["session_key"] == scope["session_key"]
+                        and row["source_ip"] == scope["source_ip"]
+                        and row["protocol"] == scope["protocol"]
+                        and historical_start <= _parse_iso(str(row["event_time"])) < historical_end
+                    )
+                    if count < 1:
+                        raise ValueError("invalid_candidate_identity")
+                    historical_counts.append(count)
+                observed_count = len(matching)
+                threshold = sorted(historical_counts)[BASELINE_HISTORY_WINDOWS // 2] * BASELINE_RATE_MULTIPLIER
+                contributor_flow_ids = tuple(sorted(str(row["flow_id"]) for row in matching))
+                contributor_material = {
+                    "count": len(contributor_flow_ids),
+                    "sha256": _canonical_digest({"flow_id": flow_id} for flow_id in contributor_flow_ids),
+                    "version": "candidate-contributors.v1",
+                }
+                reference_flow_ids = list(contributor_flow_ids[:MAX_CANDIDATE_FLOW_REFS])
+                policy = {
+                    "baseline_counts": historical_counts,
+                    "history_windows": BASELINE_HISTORY_WINDOWS,
+                    "minimum_observed_flows": BASELINE_MIN_OBSERVED_FLOWS,
+                    "rate_multiplier": BASELINE_RATE_MULTIPLIER,
+                    "window_seconds": analyzer.window_seconds,
+                }
+                expected_identity = {
+                    "contributor_material": contributor_material,
+                    "contributor_scope": scope,
+                    "policy": policy,
+                    "reference_flow_ids": reference_flow_ids,
+                    "rule_version": "flow-rate-baseline.v1",
+                    "threshold": threshold,
+                }
+                expected_basis = {
+                    "basis": "contiguous_window_flow_rate_baseline.v1",
+                    "contributor_material": contributor_material,
+                    "contributor_scope": scope,
+                    **policy,
+                    "reference_flow_ids": reference_flow_ids,
+                    "references_representative_bounded": len(reference_flow_ids) < observed_count,
+                }
+                require(
+                    identity == expected_identity
+                    and basis == expected_basis
+                    and list(candidate.flow_ids) == reference_flow_ids
+                    and candidate.window_start == window_start
+                    and candidate.window_end == window_end
+                    and candidate.observed_value == observed_count
+                    and candidate.threshold == threshold
+                    and observed_count >= BASELINE_MIN_OBSERVED_FLOWS
+                    and observed_count >= threshold
+                    and candidate.uncertainty
+                    == (
+                        "ip-allowlisted-unauthenticated",
+                        "sampling-unknown",
+                        "baseline-derived-from-supplied-retained-windows",
+                    )
                 )
                 continue
 

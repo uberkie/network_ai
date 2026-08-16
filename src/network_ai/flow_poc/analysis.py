@@ -38,6 +38,9 @@ PERIODIC_MIN_INTERVAL_MICROSECONDS = 30 * 1_000_000
 PERIODIC_MAX_INTERVAL_MICROSECONDS = 3_600 * 1_000_000
 PERIODIC_TOLERANCE_PPM = 100_000  # 10 percent
 PERIODIC_MIN_TOLERANCE_MICROSECONDS = 2 * 1_000_000
+BASELINE_HISTORY_WINDOWS = 3
+BASELINE_RATE_MULTIPLIER = 3
+BASELINE_MIN_OBSERVED_FLOWS = 10
 
 ANALYSIS_FAILURE_CODES = frozenset(
     (
@@ -223,6 +226,12 @@ class FlowAnalyzer:
                     "max_candidates": MAX_ANALYSIS_CANDIDATES,
                     "max_flow_rows": MAX_ANALYSIS_FLOW_ROWS,
                     "snapshot_selection": "complete_retained_flow_repository.v1",
+                    "flow_rate_baseline": {
+                        "history_windows": BASELINE_HISTORY_WINDOWS,
+                        "minimum_observed_flows": BASELINE_MIN_OBSERVED_FLOWS,
+                        "rate_multiplier": BASELINE_RATE_MULTIPLIER,
+                        "window_seconds": self.window_seconds,
+                    },
                     "periodic": {
                         "max_groups": MAX_PERIODIC_GROUPS,
                         "minimum_records": self.periodic_min_records,
@@ -387,9 +396,109 @@ class FlowAnalyzer:
                 ),
                 overflow_code="analysis_candidate_limit_exceeded",
             )
+        self._append_flow_rate_baseline_candidates(flow_rows, candidates, created_at)
         self._append_periodic_candidates(flow_rows, candidates, created_at)
         ordered = tuple(sorted(candidates, key=lambda candidate: candidate.candidate_id))
         return ordered
+
+    def _append_flow_rate_baseline_candidates(
+        self,
+        flow_rows: tuple[dict[str, Any], ...],
+        candidates: list[Candidate],
+        created_at: datetime,
+    ) -> None:
+        grouped: dict[tuple[str, str, int | None], dict[datetime, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
+        for row in flow_rows:
+            event_time = _parse_time(row["event_time"])
+            grouped[(str(row["session_key"]), str(row["source_ip"]), row["protocol"])][
+                _floor_window(event_time, self.window_seconds)
+            ].append(row)
+
+        for (session_key, source_ip, protocol), windows in sorted(grouped.items()):
+            for window_start, rows in sorted(windows.items()):
+                historical_starts = tuple(
+                    window_start - timedelta(seconds=self.window_seconds * offset)
+                    for offset in range(BASELINE_HISTORY_WINDOWS, 0, -1)
+                )
+                if any(start not in windows for start in historical_starts):
+                    continue
+                observed_count = len(rows)
+                if observed_count < BASELINE_MIN_OBSERVED_FLOWS:
+                    continue
+                baseline_counts = tuple(len(windows[start]) for start in historical_starts)
+                median_baseline_count = sorted(baseline_counts)[BASELINE_HISTORY_WINDOWS // 2]
+                threshold = median_baseline_count * BASELINE_RATE_MULTIPLIER
+                if observed_count < threshold:
+                    continue
+                contributor_rows = tuple(sorted(str(row["flow_id"]) for row in rows))
+                contributor_material = _flow_id_contributor_material(contributor_rows)
+                reference_flow_ids = contributor_rows[:MAX_CANDIDATE_FLOW_REFS]
+                window_end = window_start + timedelta(seconds=self.window_seconds)
+                scope = {
+                    "protocol": protocol,
+                    "session_key": session_key,
+                    "source_ip": source_ip,
+                    "window_end": window_end.isoformat(),
+                    "window_start": window_start.isoformat(),
+                }
+                policy = {
+                    "baseline_counts": baseline_counts,
+                    "history_windows": BASELINE_HISTORY_WINDOWS,
+                    "minimum_observed_flows": BASELINE_MIN_OBSERVED_FLOWS,
+                    "rate_multiplier": BASELINE_RATE_MULTIPLIER,
+                    "window_seconds": self.window_seconds,
+                }
+                identity = {
+                    "contributor_material": contributor_material,
+                    "contributor_scope": scope,
+                    "policy": policy,
+                    "reference_flow_ids": reference_flow_ids,
+                    "rule_version": "flow-rate-baseline.v1",
+                    "threshold": threshold,
+                }
+                identity_material_json = _identity_material(identity)
+                candidate_id = _candidate_id("flow-rate-baseline.v1", identity)
+                self._append_candidate(
+                    candidates,
+                    Candidate(
+                        candidate_id=candidate_id,
+                        rule_id="flow-rate-baseline.v1",
+                        rule_version="flow-rate-baseline.v1",
+                        created_at=created_at,
+                        window_start=window_start,
+                        window_end=window_end,
+                        threshold=threshold,
+                        observed_value=observed_count,
+                        source_ip=source_ip,
+                        destination_ip=None,
+                        destination_port=None,
+                        protocol=protocol,
+                        session_key=session_key,
+                        flow_ids=reference_flow_ids,
+                        uncertainty=(
+                            "ip-allowlisted-unauthenticated",
+                            "sampling-unknown",
+                            "baseline-derived-from-supplied-retained-windows",
+                        ),
+                        identity_material_json=identity_material_json,
+                        basis_json=canonical_json(
+                            {
+                                "basis": "contiguous_window_flow_rate_baseline.v1",
+                                "contributor_material": contributor_material,
+                                "contributor_scope": scope,
+                                **policy,
+                                "reference_flow_ids": reference_flow_ids,
+                                "references_representative_bounded": len(reference_flow_ids) < observed_count,
+                            }
+                        ),
+                        explanation=(
+                            "Flow-rate candidate for analyst review: the supplied source/session/protocol window met "
+                            "the configured multiple of three immediately preceding contiguous retained windows; "
+                            "this is not proof of abnormal network activity or compromise."
+                        ),
+                    ),
+                    overflow_code="analysis_candidate_limit_exceeded",
+                )
 
     def _append_periodic_candidates(
         self,

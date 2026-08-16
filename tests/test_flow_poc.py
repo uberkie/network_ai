@@ -260,6 +260,64 @@ class FlowPocTests(unittest.TestCase):
                     [],
                 )
 
+    def test_flow_rate_baseline_candidate_requires_contiguous_history_and_is_reorder_stable(self) -> None:
+        rows = tuple(
+            self._periodic_row(
+                index,
+                window * 300_000_000 + item * 1_000_000,
+                source_port=40_000 + index,
+                destination_port=8_000 + item,
+            )
+            for window, count in enumerate((2, 2, 2, 10))
+            for item in range(count)
+            for index in (sum((2, 2, 2, 10)[:window]) + item,)
+        )
+        candidates = FlowAnalyzer().analyze(rows, now=self.received_at)
+        reversed_candidates = FlowAnalyzer().analyze(tuple(reversed(rows)), now=self.received_at)
+        baseline = tuple(candidate for candidate in candidates if candidate.rule_id == "flow-rate-baseline.v1")
+        self.assertEqual(len(baseline), 1)
+        self.assertEqual(baseline[0].observed_value, 10)
+        self.assertEqual(baseline[0].threshold, 6)
+        self.assertEqual(baseline[0].window_start, self.received_at + timedelta(seconds=900))
+        self.assertEqual(baseline[0].flow_ids, tuple(sorted(row["flow_id"] for row in rows[-10:])))
+        self.assertEqual(
+            baseline[0].candidate_id,
+            next(candidate for candidate in reversed_candidates if candidate.rule_id == "flow-rate-baseline.v1").candidate_id,
+        )
+
+    def test_flow_rate_baseline_candidate_is_recomputed_before_persistence(self) -> None:
+        offsets = tuple(
+            window * 300_000_000 + item * 1_000_000
+            for window, count in enumerate((2, 2, 2, 10))
+            for item in range(count)
+        )
+        self._persist_periodic_rows(offsets)
+        outcome = analyze_and_record(self.repository, now=self.received_at, bounded=False)
+        self.assertEqual(outcome.status, "completed")
+        self.assertEqual(outcome.audit_state, "written")
+        assert outcome.analysis_run_id is not None
+        rows = self.repository.candidate_rows(analysis_run_id=outcome.analysis_run_id)
+        baseline = next(row for row in rows if row["rule_id"] == "flow-rate-baseline.v1")
+        self.assertEqual(baseline["observed_value"], 10)
+        self.assertEqual(baseline["threshold"], 6)
+        self.assertEqual(baseline["basis"]["baseline_counts"], [2, 2, 2])
+
+    def test_flow_rate_baseline_candidate_does_not_cross_a_missing_history_window(self) -> None:
+        rows = tuple(
+            self._periodic_row(
+                index,
+                window * 300_000_000 + item * 1_000_000,
+                source_port=40_000 + index,
+            )
+            for window, count in ((0, 2), (1, 2), (3, 10))
+            for item in range(count)
+            for index in (sum(count for prior_window, count in ((0, 2), (1, 2), (3, 10)) if prior_window < window) + item,)
+        )
+        self.assertEqual(
+            [candidate for candidate in FlowAnalyzer().analyze(rows, now=self.received_at) if candidate.rule_id == "flow-rate-baseline.v1"],
+            [],
+        )
+
     def test_periodic_group_cap_is_fail_visible_before_partial_candidate_output(self) -> None:
         rows = (
             self._periodic_row(0, 0, destination_port=443),
@@ -320,7 +378,7 @@ class FlowPocTests(unittest.TestCase):
             connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
             connection.request("GET", "/api/candidates")
             payload = json.loads(connection.getresponse().read().decode("utf-8"))
-            self.assertEqual(payload["analysis_status"], "failed")
+            self.assertEqual(payload["analysis_status"], "unavailable")
             self.assertEqual(payload["candidates"], [])
         finally:
             server.shutdown()
@@ -664,6 +722,163 @@ class FlowPocTests(unittest.TestCase):
                 thread.join(timeout=3)
         self.assertEqual(repository_factory.call_count, 1)
 
+    def test_dashboard_starts_and_stops_one_bounded_loopback_collector(self) -> None:
+        server = dashboard_server(self.root, port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+
+            def request(payload: dict[str, object]) -> tuple[int, dict[str, object]]:
+                connection.request(
+                    "POST",
+                    "/api/collector",
+                    body=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                response = connection.getresponse()
+                return response.status, json.loads(response.read().decode("utf-8"))
+
+            status, started = request(
+                {
+                    "action": "start",
+                    "policy": {
+                        "allow_nonloopback": False,
+                        "bind_host": "127.0.0.1",
+                        "duration_seconds": 60,
+                        "exporter_allowlist": ["127.0.0.1/32"],
+                        "max_datagrams": 10,
+                        "port": self._unused_loopback_port(),
+                    },
+                }
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(started["running"])
+            self.assertEqual(started["policy"]["bind_host"], "127.0.0.1")
+            status, stopped = request({"action": "stop"})
+            self.assertEqual(status, 200)
+            self.assertFalse(stopped["running"])
+            self.assertEqual(stopped["stats"]["run_state"], "interrupted")
+            latest = self.repository.summary()["latest_collection_run"]
+            assert latest is not None
+            self.assertEqual(latest["state"], "interrupted")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_dashboard_hides_an_old_completed_analysis_from_the_live_view(self) -> None:
+        collection_run_id = self.repository.start_collection_run(
+            collector_configuration_sha256="a" * 64,
+            started_at=self.received_at,
+        )
+        self.repository.finish_collection_run(
+            collection_run_id,
+            completed_at=self.received_at,
+            state="completed",
+            counters={},
+            last_received_at=self.received_at,
+            last_persisted_at=self.received_at,
+            last_error_code=None,
+        )
+        self._commit_completed_analysis(collection_run_id=collection_run_id, at=self.received_at)
+        server = dashboard_server(self.root, port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+            connection.request("GET", "/")
+            page = connection.getresponse().read().decode("utf-8")
+            self.assertIn("No live anomaly analysis is available", page)
+            self.assertNotIn("Input snapshot state", page)
+            self.assertIn("Live analyst candidates", page)
+            connection.request("GET", "/api/candidates")
+            payload = json.loads(connection.getresponse().read().decode("utf-8"))
+            self.assertEqual(payload["freshness"]["mode"], "live_flow_anomaly_unavailable")
+            self.assertFalse(payload["freshness"]["flow_data_live"])
+            self.assertEqual(payload["analysis_status"], "unavailable")
+            self.assertEqual(payload["candidates"], [])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_local_signature_catalog_supports_crud_toggle_import_and_download(self) -> None:
+        server = dashboard_server(self.root, port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+            connection.request("GET", "/signatures")
+            signature_page = connection.getresponse()
+            self.assertEqual(signature_page.status, 200)
+            self.assertIn("connect-src 'self'", signature_page.getheader("Content-Security-Policy"))
+            signature_page.read()
+
+            def request(action: str, **payload: object) -> tuple[int, dict[str, object]]:
+                body = json.dumps({"action": action, **payload}).encode("utf-8")
+                connection.request("POST", "/api/signatures", body=body, headers={"Content-Type": "application/json"})
+                response = connection.getresponse()
+                return response.status, json.loads(response.read().decode("utf-8"))
+
+            status, created = request(
+                "create",
+                signature_id=2100365,
+                name="Synthetic policy alert",
+                severity=2,
+                rule_text="alert tcp any any -> any any (msg:\"Synthetic policy alert\"; sid:2100365;)",
+                enabled=True,
+            )
+            self.assertEqual(status, 201)
+            self.assertEqual(created["signature"]["enabled"], True)
+
+            status, updated = request(
+                "update",
+                signature_id=2100365,
+                name="Synthetic policy alert v2",
+                severity=3,
+                rule_text="alert tcp any any -> any any (msg:\"Synthetic policy alert v2\"; sid:2100365;)",
+                enabled=False,
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(updated["signature"]["name"], "Synthetic policy alert v2")
+            self.assertFalse(updated["signature"]["enabled"])
+
+            status, toggled = request("set_enabled", signature_id=2100365, enabled=True)
+            self.assertEqual(status, 200)
+            self.assertTrue(toggled["signature"]["enabled"])
+
+            connection.request("GET", "/api/signatures/download")
+            download = connection.getresponse()
+            self.assertEqual(download.status, 200)
+            exported = json.loads(download.read().decode("utf-8"))
+            self.assertEqual(exported["signatures"][0]["signature_id"], 2100365)
+
+            status, imported = request(
+                "import",
+                signatures=[
+                    {
+                        "signature_id": 2100365,
+                        "name": "Imported policy alert",
+                        "severity": 1,
+                        "rule_text": "alert tcp any any -> any any (msg:\"Imported policy alert\"; sid:2100365;)",
+                        "enabled": False,
+                    }
+                ],
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(imported["updated"], 1)
+
+            status, deleted = request("delete", signature_id=2100365)
+            self.assertEqual(status, 200)
+            self.assertEqual(deleted["deleted"], 1)
+            connection.request("GET", "/api/signatures")
+            self.assertEqual(json.loads(connection.getresponse().read().decode("utf-8"))["signatures"], [])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
     def test_state_capacity_is_visible_before_parsing_or_persisting(self) -> None:
         first = netflow_v9_message(sequence=1, include_template=True, records=(_record("198.51.100.90", "203.0.113.90"),))
         second = netflow_v9_message(sequence=1, include_template=True, records=(_record("198.51.100.91", "203.0.113.91"),))
@@ -829,6 +1044,41 @@ class FlowPocTests(unittest.TestCase):
         self.assertEqual(collector.stats.analysis_audit_failures, 1)
         self.assertEqual(collector.stats.last_error_code, "analysis_audit_unavailable")
         self.assertIsNone(self.repository.summary()["latest_analysis_run"])
+
+    def test_pending_live_analysis_catches_up_after_the_rate_limit_without_a_new_datagram(self) -> None:
+        collector = FlowCollector(
+            self.repository,
+            ListenerPolicy(),
+            auto_analyze=True,
+            analysis_min_interval_seconds=1,
+        )
+        first = synthetic_demo_messages()[0]
+        second = netflow_v9_message(
+            sequence=2,
+            include_template=False,
+            records=(_record("198.51.100.1", "203.0.113.99"),),
+        )
+        collector.ingest_datagram(
+            first,
+            exporter_ip="127.0.0.1",
+            exporter_port=20_555,
+            received_at=self.received_at,
+            now_monotonic=0,
+        )
+        collector.ingest_datagram(
+            second,
+            exporter_ip="127.0.0.1",
+            exporter_port=20_555,
+            received_at=self.received_at + timedelta(milliseconds=500),
+            now_monotonic=0.5,
+        )
+        self.assertTrue(collector._analysis_pending)
+        collector._maybe_analyze(1.0)
+        self.assertFalse(collector._analysis_pending)
+        self.assertEqual(collector.stats.analysis_runs, 2)
+        latest = self.repository.latest_analysis_run()
+        assert latest is not None
+        self.assertEqual(latest["status"], "completed")
 
     def test_analysis_run_history_and_quota_are_bounded(self) -> None:
         with patch("network_ai.flow_poc.storage.MAX_ANALYSIS_RUNS", 2):
@@ -1154,17 +1404,17 @@ class FlowPocTests(unittest.TestCase):
             response = connection.getresponse()
             page = response.read().decode("utf-8")
             self.assertEqual(response.status, 200)
-            self.assertIn("Current analyst candidates", page)
+            self.assertIn("Live analyst candidates", page)
             self.assertIn("Analysis status", page)
-            self.assertIn("Detector configuration", page)
-            self.assertNotIn("<script", page.lower())
+            self.assertIn("No live anomaly analysis is available", page)
+            self.assertIn("collectorRequest", page)
             connection.request("GET", "/api/summary")
             self.assertEqual(connection.getresponse().status, 200)
             connection.request("GET", "/api/candidates")
             candidates = json.loads(connection.getresponse().read().decode("utf-8"))
-            self.assertEqual(candidates["analysis_status"], "completed")
+            self.assertEqual(candidates["analysis_status"], "unavailable")
             self.assertIsInstance(candidates["candidates"], list)
-            self.assertIn("bounded stored-flow snapshot", candidates["scope"])
+            self.assertIn("active collector", candidates["scope"])
             self.assertNotIn("raw", json.dumps(candidates, sort_keys=True).lower())
         finally:
             server.shutdown()
@@ -1189,7 +1439,7 @@ class FlowPocTests(unittest.TestCase):
             connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
             connection.request("GET", "/")
             page = connection.getresponse().read().decode("utf-8")
-            self.assertIn("analysis_failure", page)
+            self.assertIn("No live anomaly analysis is available", page)
             self.assertIn("Analysis is degraded", page)
             self.assertIn("candidate state is unknown", page)
         finally:
@@ -1217,7 +1467,7 @@ class FlowPocTests(unittest.TestCase):
             connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
             connection.request("GET", "/api/candidates")
             payload = json.loads(connection.getresponse().read().decode("utf-8"))
-            self.assertEqual(payload["analysis_status"], "unknown")
+            self.assertEqual(payload["analysis_status"], "unavailable")
             self.assertEqual(payload["candidates"], [])
         finally:
             server.shutdown()
@@ -1246,8 +1496,8 @@ class FlowPocTests(unittest.TestCase):
                 connection = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
                 connection.request("GET", "/")
                 page = connection.getresponse().read().decode("utf-8")
-                self.assertIn("No durable analysis result has been recorded for the displayed collection run", page)
-                self.assertIn("Candidate state is unknown", page)
+                self.assertIn("No live anomaly analysis is available", page)
+                self.assertIn("Stored historical analysis is intentionally hidden", page)
             finally:
                 server.shutdown()
                 server.server_close()

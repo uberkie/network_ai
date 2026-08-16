@@ -481,7 +481,7 @@ class FlowCollector:
             last_error_code=self.stats.last_error_code,
         )
 
-    def serve(self, *, ready_event: Any | None = None) -> CollectorStats:
+    def serve(self, *, ready_event: Any | None = None, stop_event: Any | None = None) -> CollectorStats:
         """Listen for one bounded run; never binds wildcard/DNS addresses."""
         bind_address = ipaddress.ip_address(self.policy.bind_host)
         family = socket.AF_INET6 if bind_address.version == 6 else socket.AF_INET
@@ -510,13 +510,22 @@ class FlowCollector:
                 if ready_event is not None:
                     ready_event.set()
                 processed = 0
-                while processed < self.policy.max_datagrams and time.monotonic() < deadline:
+                while (
+                    processed < self.policy.max_datagrams
+                    and time.monotonic() < deadline
+                    and not (stop_event is not None and stop_event.is_set())
+                ):
                     if time.monotonic() - last_heartbeat >= RUN_HEARTBEAT_INTERVAL_SECONDS:
                         self._heartbeat_run(run_id, datetime.now(tz=timezone.utc))
                         last_heartbeat = time.monotonic()
                     try:
                         raw, peer = listener.recvfrom(MAX_DATAGRAM_BYTES + 1)
                     except TimeoutError:
+                        # A short burst can leave new persisted flows pending
+                        # after the last rate-limited analysis. Recheck during
+                        # idle receive cycles so an active live view catches up
+                        # without waiting for another datagram.
+                        self._maybe_analyze(time.monotonic())
                         continue
                     processed += 1
                     if len(raw) > MAX_DATAGRAM_BYTES:
@@ -542,7 +551,10 @@ class FlowCollector:
                         terminal_state = "persistence_failed"
                         self.stats.last_error_code = self.stats.last_error_code or "persistence_failure"
                         break
-                if self.stats.accepted == 0 and terminal_state == "completed":
+                if stop_event is not None and stop_event.is_set():
+                    self.stats.interrupted += 1
+                    terminal_state = "interrupted"
+                elif self.stats.accepted == 0 and terminal_state == "completed":
                     terminal_state = "completed_no_accepted_datagrams"
         except KeyboardInterrupt:
             self.stats.interrupted += 1
