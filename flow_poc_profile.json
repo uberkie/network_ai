@@ -1,0 +1,10 @@
+{
+  "profile": "network-ai-flow-poc.v2",
+  "supported_protocols": ["NetFlow v9", "IPFIX v10"],
+  "supported_information_elements": [1, 2, 4, 7, 8, 11, 12, 21, 22, 27, 28, 60, 61, 152, 153],
+  "options_handling": "structurally valid options-template metadata is cached only to identify bounded options data sets; options data is ignored, counted as degraded completeness, and never decoded as a flow",
+  "rejected": ["NetFlow v5", "enterprise fields", "variable-length fields", "unknown or malformed options data", "packet payload"],
+  "unretained_fixed_fields": "standard fixed-width fields of at most 32 bytes may be used only to locate record boundaries; their values are neither stored nor exposed",
+  "retention": "manual transactional pruning; 24-hour suggested POC policy",
+  "source_trust_state": "ip_allowlisted_unauthenticated"
+}
