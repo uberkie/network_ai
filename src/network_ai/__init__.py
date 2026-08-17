@@ -20,8 +20,10 @@ from .outcomes import (
 )
 from .replay import ReplayError, ReplayTrace, ReplayTraceStore, replay_trace
 from .store import AuditCheckpoint, FileEvidenceStore
+from .analyst import ANALYST_CONTRACT_VERSION, build_analyst_snapshot, filter_evidence
 
 __all__ = [
+    "ANALYST_CONTRACT_VERSION",
     "AuditCheckpoint",
     "AuditState",
     "AnalysisOutcome",
@@ -42,5 +44,7 @@ __all__ = [
     "ReplayTraceStore",
     "SourceType",
     "StageOutcome",
+    "build_analyst_snapshot",
+    "filter_evidence",
     "replay_trace",
 ]
